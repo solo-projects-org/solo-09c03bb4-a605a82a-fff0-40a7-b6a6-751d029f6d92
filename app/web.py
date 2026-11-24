@@ -158,8 +158,10 @@ def create_app(db_path: Optional[str] = None) -> Flask:
         else:
             flash(
                 f"改动 {metrics['changed_cells']} 格；仅重算包含改动格的节点 "
-                f"{metrics['nodes_recomputed']} 个，块增 {metrics['blocks_added']} / "
-                f"删 {metrics['blocks_removed']}", "ok")
+                f"{metrics['nodes_recomputed']} 个；新增块 {metrics['blocks_added']}，"
+                f"实际删块 {metrics['blocks_removed']}，写入作废记录 "
+                f"{metrics['tombstone_records']} 条（其中范围作废 "
+                f"{metrics['tombstone_ranges']} 条）", "ok")
         return redirect(url_for("index"))
 
     # --------------------------- 温差 ---------------------------

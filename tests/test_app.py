@@ -21,6 +21,7 @@ from itertools import product
 
 from app import csvutil, db, quadtree
 from app.web import create_app
+from tests import legacy_fixture
 
 
 def make_grid(n, fill=None, seed=0):
@@ -308,19 +309,8 @@ class ServiceIncrementalTests(unittest.TestCase):
         db.create_grid(self.conn, n, data, 12)
 
         def delta_reconstruct():
-            rows = self.conn.execute(
-                "WITH latest AS ("
-                "SELECT o.row_idx, o.col_idx, o.side, MAX(o.id) AS mid FROM block_op o "
-                "JOIN batch b ON b.id=o.batch_id "
-                "WHERE b.id <= (SELECT id FROM batch WHERE grid_id=1 AND is_current=1) "
-                "GROUP BY o.row_idx, o.col_idx, o.side) "
-                "SELECT o.row_idx, o.col_idx, o.side, o.temp_max, o.temp_min, o.cell_count "
-                "FROM latest JOIN block_op o ON o.id=latest.mid "
-                "WHERE o.op<>'tombstone'"
-            ).fetchall()
-            # 字段顺序与 block_set 对齐：(row, col, side, tmin, tmax, count)
-            return {(r["row_idx"], r["col_idx"], r["side"], r["temp_min"],
-                     r["temp_max"], r["cell_count"]) for r in rows}
+            # 新日志含 tombstone_range，统一走服务层的重放实现（兼容旧逐块墓碑）
+            return block_set(db.replay_current_blocks(self.conn))
 
         for step in range(120):
             edits = {}
@@ -373,7 +363,8 @@ class ServiceIncrementalTests(unittest.TestCase):
 
     def test_block_merge_emits_region_tombstones(self):
         """清空后再补测使一个四分象限从非法变合法：内部旧小块必须被吸收，
-        物化表/delta 中不得残留与新大块重叠的后代块。"""
+        物化表/重放中不得残留与新大块重叠的后代块；每个合并区域只追加
+        一条范围作废记录。"""
         # 2x2，tol=0：初始四格温度相同 -> 一块 2x2
         conn = self.conn
         db.create_grid(conn, 2, [[50, 50], [50, 50]], 0)
@@ -383,17 +374,24 @@ class ServiceIncrementalTests(unittest.TestCase):
         blocks = db.load_current_blocks(conn)
         self.assertEqual(sorted(b.size for b in blocks), [1, 1, 1, 1])
         # 改回相同温度 -> 重新合并为一块，不得有残留叶子块
-        db.apply_edits(conn, {(0, 0): 50})
+        before = conn.execute("SELECT MAX(id) FROM block_op").fetchone()[0]
+        metrics = db.apply_edits(conn, {(0, 0): 50})
         blocks = db.load_current_blocks(conn)
         self.assertEqual(len(blocks), 1)
         self.assertEqual(blocks[0].size, 2)
-        # delta 还原同样只剩一块
-        rows = conn.execute(
-            "WITH latest AS (SELECT row_idx,col_idx,side,MAX(id) mid FROM block_op "
-            "GROUP BY row_idx,col_idx,side) "
-            "SELECT o.side FROM latest JOIN block_op o ON o.id=latest.mid "
-            "WHERE o.op<>'tombstone'").fetchall()
-        self.assertEqual([r["side"] for r in rows], [2])
+        # 重放同样只剩一块
+        self.assertEqual(block_set(db.replay_current_blocks(conn)),
+                         block_set(blocks))
+        # 合块时每个区域只追加一条范围作废记录（不是每个被吸收块一条）
+        new_ops = conn.execute(
+            "SELECT op, COUNT(*) FROM block_op WHERE id>? GROUP BY op",
+            (before,)).fetchall()
+        counts = {r[0]: r[1] for r in new_ops}
+        self.assertEqual(counts.get("tombstone_range"), 1)
+        self.assertEqual(counts.get("tombstone"), None)
+        self.assertEqual(metrics["tombstone_ranges"], 1)
+        # 物化表里实际删掉的正是四个被吸收的叶子块
+        self.assertEqual(metrics["blocks_removed"], 4)
 
     def test_tolerance_change(self):
         n = 8
@@ -429,6 +427,175 @@ class ServiceIncrementalTests(unittest.TestCase):
         self.assertEqual([r["reason"] for r in rows], ["upload", "edit", "tolerance"])
         self.assertEqual(sum(r["is_current"] for r in rows), 1)
         self.assertTrue(rows[-1]["is_current"])
+
+    def test_replay_from_empty_upload(self):
+        """全未测上传无 base 行：重放仍须从该批次起锚。"""
+        db.create_grid(self.conn, 4, [[None] * 4 for _ in range(4)], 10)
+        self.assertEqual(db.current_block_count(self.conn), 0)
+        self.assertTrue(db.replay_matches_materialized(self.conn))
+        db.apply_edits(self.conn, {(1, 1): 5})
+        self.assertTrue(db.replay_matches_materialized(self.conn))
+        self.assertEqual(
+            [(b.row, b.col, b.size) for b in db.load_current_blocks(self.conn)],
+            [(1, 1, 1)])
+
+    def test_range_record_only_when_blocks_absorbed(self):
+        """范围作废与实际删块对应：无旧块可吸时不写空记录。"""
+        db.create_grid(self.conn, 2, [[10, 10], [10, 10]], 0)
+        db.apply_edits(self.conn, {(0, 0): 99})
+        before = self.conn.execute("SELECT MAX(id) FROM block_op").fetchone()[0]
+        m = db.apply_edits(self.conn, {(0, 0): 10})
+        self.assertEqual(m["blocks_removed"], 4)
+        self.assertEqual(m["tombstone_ranges"], 1)
+        # 已经是整块，再做一次同值编辑不产生批次与记录
+        m2 = db.apply_edits(self.conn, {(0, 0): 10})
+        self.assertEqual(m2["changed_cells"], 0)
+        self.assertEqual(m2["tombstone_records"], 0)
+        # 合块批次只追加 1 条范围作废 + 1 条 add，而不是 4 条逐块作废
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM block_op WHERE id>?",
+                              (before,)).fetchone()[0], 2)
+        # 范围记录本身不是块，重放与现行块仍逐块一致
+        self.assertTrue(db.replay_matches_materialized(self.conn))
+
+
+class LegacyCompatibilityTests(unittest.TestCase):
+    """旧库升级：逐块作废记录原样保留，续写/合块/拆块后重放与现行块一致。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.tmp.name, "legacy.db")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _make_legacy(self, n=16, seed=11, tol=8):
+        conn = legacy_fixture.create_legacy_db(self.db_path)
+        rng = random.Random(seed)
+        data = [[None if rng.random() < 0.2 else rng.randint(0, 100)
+                 for _ in range(n)] for _ in range(n)]
+        legacy_fixture.legacy_upload(conn, n, data, tol)
+        # 造出真实的逐块 tombstone：先拆碎再合回一部分
+        legacy_fixture.legacy_apply_edits(conn, {(0, 0): 99, (1, 0): 98})
+        legacy_fixture.legacy_apply_edits(conn, {(0, 0): data[0][0]})
+        legacy_fixture.legacy_update_tolerance(conn, tol)
+        legacy_fixture.legacy_apply_edits(conn, {(n - 1, n - 1): None})
+        return conn
+
+    def test_upgrade_preserves_legacy_rows_and_blocks(self):
+        legacy = self._make_legacy()
+        old_ops = [tuple(r) for r in legacy.execute(
+            "SELECT id,batch_id,row_idx,col_idx,side,op,temp_max,temp_min,"
+            "cell_count FROM block_op ORDER BY id")]
+        old_bid = db.current_batch_id(legacy)
+        old_blocks = block_set(db.load_current_blocks(legacy))
+        self.assertTrue(any(op[5] == "tombstone" for op in old_ops))
+        legacy.close()
+
+        db.init_db(self.db_path)
+        conn = db.connect(self.db_path)
+        try:
+            new_sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name='block_op'").fetchone()[0]
+            self.assertIn("tombstone_range", new_sql)
+            self.assertEqual(
+                [tuple(r) for r in conn.execute(
+                    "SELECT id,batch_id,row_idx,col_idx,side,op,temp_max,"
+                    "temp_min,cell_count FROM block_op ORDER BY id")],
+                old_ops, "旧逐块日志必须原样保留")
+            self.assertEqual(db.current_batch_id(conn), old_bid)
+            self.assertEqual(block_set(db.load_current_blocks(conn)), old_blocks)
+            self.assertTrue(db.replay_matches_materialized(conn))
+        finally:
+            conn.close()
+
+    def test_regenerates_missing_materialized_table(self):
+        legacy = self._make_legacy()
+        expected = block_set(db.load_current_blocks(legacy))
+        legacy.execute("DROP TABLE blocks_current")
+        legacy.close()
+
+        db.init_db(self.db_path)
+        conn = db.connect(self.db_path)
+        try:
+            self.assertEqual(block_set(db.load_current_blocks(conn)), expected)
+        finally:
+            conn.close()
+
+    def test_continue_write_new_ids_do_not_collide(self):
+        legacy = self._make_legacy()
+        max_old = legacy.execute("SELECT MAX(id) FROM block_op").fetchone()[0]
+        legacy.close()
+        db.init_db(self.db_path)
+        conn = db.connect(self.db_path)
+        try:
+            db.apply_edits(conn, {(0, 0): 1})
+            new_ids = [r[0] for r in conn.execute(
+                "SELECT id FROM block_op WHERE id>?", (max_old,))]
+            self.assertTrue(new_ids)
+            self.assertGreater(min(new_ids), max_old)
+            self.assertTrue(db.replay_matches_materialized(conn))
+        finally:
+            conn.close()
+
+    def test_mixed_old_and_new_records_replay_equal_current(self):
+        """自最近一次全量出块起，新旧记录混用重放 == 现行供数。"""
+        legacy = self._make_legacy()
+        legacy.close()
+        db.init_db(self.db_path)
+        conn = db.connect(self.db_path)
+        try:
+            # 续写、合块、拆块各来一轮
+            db.apply_edits(conn, {(0, 0): 77})
+            db.apply_edits(conn, {(0, 0): None})
+            db.apply_edits(conn, {(0, 0): 5, (0, 1): 5, (1, 0): 5, (1, 1): 5})
+            db.update_tolerance(conn, 6)
+            db.apply_edits(conn, {(0, 0): 200})
+            self.assertTrue(db.replay_matches_materialized(conn))
+            ops = {r[0] for r in conn.execute(
+                "SELECT DISTINCT op FROM block_op")}
+            self.assertIn("tombstone", ops, "旧逐块记录仍在库中")
+            self.assertIn("tombstone_range", ops, "新范围记录已追加")
+            expect, _ = full_rebuild_blocks(conn)
+            self.assertEqual(block_set(db.load_current_blocks(conn)),
+                             block_set(expect))
+        finally:
+            conn.close()
+
+    def test_new_big_block_survives_later_split_and_clear(self):
+        """同批新写的大块有效；后来拆开/清空不得把它带回来。"""
+        conn = legacy_fixture.create_legacy_db(self.db_path)
+        legacy_fixture.legacy_upload(conn, 2, [[10, 10], [10, 10]], 0)
+        legacy_fixture.legacy_apply_edits(conn, {(0, 0): 99})
+        conn.close()
+
+        db.init_db(self.db_path)
+        conn = db.connect(self.db_path)
+        try:
+            # 改回相同温度 -> 合并为新大块 2x2（同批 tombstone_range + add）
+            db.apply_edits(conn, {(0, 0): 10})
+            blocks = db.load_current_blocks(conn)
+            self.assertEqual([(b.row, b.col, b.size) for b in blocks], [(0, 0, 2)])
+            self.assertEqual(block_set(db.replay_current_blocks(conn)),
+                             block_set(blocks))
+            # 再拆开：2x2 大块被精确作废，叶子补发
+            db.apply_edits(conn, {(1, 1): 90})
+            self.assertEqual(
+                sorted((b.row, b.col, b.size) for b in db.load_current_blocks(conn)),
+                [(0, 0, 1), (0, 1, 1), (1, 0, 1), (1, 1, 1)])
+            self.assertTrue(db.replay_matches_materialized(conn))
+            # 清空全部：不得把更早的 2x2 大块“复活”
+            db.apply_edits(conn, {(r, c): None for r in range(2) for c in range(2)})
+            self.assertEqual(db.load_current_blocks(conn), [])
+            self.assertTrue(db.replay_matches_materialized(conn))
+            # 再补测一格：只有该叶块
+            db.apply_edits(conn, {(1, 0): 7})
+            self.assertEqual(
+                [(b.row, b.col, b.size) for b in db.load_current_blocks(conn)],
+                [(1, 0, 1)])
+            self.assertTrue(db.replay_matches_materialized(conn))
+        finally:
+            conn.close()
 
 
 class WebEndToEndTests(unittest.TestCase):

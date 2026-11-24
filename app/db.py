@@ -11,11 +11,16 @@ batch     : 批次。上传/改温差/补测清空成功各生成一个批次，
             is_current=1 的批次对应“现行供数”；批次一经生效不可变
 block_op  : 块变更日志（delta 模型）
             * 上传、改温差写一整套 op='base' 的现行块；
-            * 补测/清空只在受影响子树写 op='add'（新块）与
-              op='tombstone'（旧块作废），写入量与改动量成正比；
-            * 现行块 = 每个块坐标 (row,col,side) 上批次号最大的一条操作，
-              add 生效、tombstone 丢弃。下载与页面同源读取，保证
-              位置、边长、温度来自同一批已生效数据。
+            * 补测/清空只在受影响子树写 op='add'（新块）、
+              op='tombstone'（精确坐标作废）与 op='tombstone_range'
+              （整块区域作废，吸收内部旧块时每个区域只记一条）；
+            * 旧库遗留的逐块 op='tombstone' 原样保留，重放时与新记录混用；
+            * 现行块 = 从最近一次 base 批次起重放：每个坐标取最新精确操作，
+              add/base 生效、tombstone 丢弃；若其后有覆盖该坐标（严格位于
+              区域内）的 tombstone_range，则该块作废。区域记录不作用于
+              同批写在该区域原点的大块，故新大块始终有效。
+            * 物化表 blocks_current 与日志在同一事务内用局部核算维护，
+              作废旧块只查局部物化表，不再回查历史日志。
 event_log : 操作审计
 
 增量核算（补测/清空）
@@ -23,7 +28,8 @@ event_log : 操作审计
 1. 取改动格的全部祖先节点；
 2. 自底向上（size 升序）只重算这些节点（及其直接孩子）的统计与合法标志；
 3. 自根向下收集块增量：未受影响子树整棵跳过（旧块继续生效），
-   受影响路径上按新合法性写 add / tombstone；
+   受影响路径上按新合法性写 add / tombstone / tombstone_range；
+   合并时每个区域只写一条范围作废；
 4. 全流程在一个 BEGIN IMMEDIATE 事务内，异常回滚，旧批次与旧供数不变。
 """
 
@@ -81,22 +87,38 @@ CREATE TABLE IF NOT EXISTS batch (
     created_at  TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS event_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    detail     TEXT NOT NULL
+);
+"""
+
+
+# block_op 单独成段：旧库升级时要按新 CHECK 约束重建该表。
+BLOCK_OP_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS block_op (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id   INTEGER NOT NULL REFERENCES batch(id),
     row_idx    INTEGER NOT NULL,
     col_idx    INTEGER NOT NULL,
     side       INTEGER NOT NULL,
-    op         TEXT NOT NULL CHECK (op IN ('base','add','tombstone')),
+    op         TEXT NOT NULL CHECK (op IN ('base','add','tombstone','tombstone_range')),
     temp_max   INTEGER,
     temp_min   INTEGER,
     cell_count INTEGER
-);
+)
+"""
+
+BLOCK_OP_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_block_op_batch ON block_op(batch_id);
 CREATE INDEX IF NOT EXISTS idx_block_op_pos ON block_op(row_idx, col_idx, side);
+"""
 
--- 现行块物化表：与 block_op 在同一事务内维护，下载/页面直接顺序读取，
--- 无需跨批次还原；表内只保留 is_current 批次对应的块，天然同源。
+# 现行块物化表：与 block_op 在同一事务内维护，下载/页面直接顺序读取，
+# 无需跨批次还原；表内只保留 is_current 批次对应的块，天然同源。
+BLOCKS_CURRENT_SQL = """
 CREATE TABLE IF NOT EXISTS blocks_current (
     row_idx    INTEGER NOT NULL,
     col_idx    INTEGER NOT NULL,
@@ -106,13 +128,6 @@ CREATE TABLE IF NOT EXISTS blocks_current (
     cell_count INTEGER NOT NULL,
     PRIMARY KEY (row_idx, col_idx, side)
 ) WITHOUT ROWID;
-
-CREATE TABLE IF NOT EXISTS event_log (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts         TEXT NOT NULL,
-    kind       TEXT NOT NULL,
-    detail     TEXT NOT NULL
-);
 """
 
 
@@ -143,8 +158,74 @@ def init_db(db_path: Optional[str] = None) -> None:
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        _ensure_block_op_schema(conn)
+        conn.executescript(BLOCK_OP_INDEX_SQL)
+        # 仅在物化表缺失时按日志重放补建；已有的现行块表保持原样，
+        # 避免升级动作误伤现场数据。逐块旧记录一律不删不改。
+        if _ensure_blocks_current(conn):
+            with transaction(conn):
+                conn.execute("DELETE FROM blocks_current")
+                _rebuild_materialized(conn, replay_current_blocks(conn))
     finally:
         conn.close()
+
+
+def _table_sql(conn: sqlite3.Connection, name: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (name,)).fetchone()
+    return row[0] if row else None
+
+
+def _ensure_block_op_schema(conn: sqlite3.Connection) -> bool:
+    """
+    旧库的 block_op 只接受 base/add/tombstone 三种 op。若检测到旧 CHECK
+    约束，则在保留全部历史行的前提下重建该表并放开 tombstone_range。
+    返回是否做了迁移。
+    """
+    sql = _table_sql(conn, "block_op")
+    if sql is None:
+        conn.execute(BLOCK_OP_TABLE_SQL)
+        return False
+    if "tombstone_range" in sql:
+        return False
+
+    with transaction(conn):
+        # 旧表可能带着索引；改名后索引跟随旧表，先记下名字再删除
+        # （sqlite_autoindex_* 由约束自动生成，不能单独 DROP）。
+        index_names = [r[1] for r in conn.execute("PRAGMA index_list('block_op')")
+                       if not r[1].startswith("sqlite_autoindex")]
+        conn.execute("ALTER TABLE block_op RENAME TO block_op_legacy")
+        for idx_name in index_names:
+            conn.execute(f'DROP INDEX IF EXISTS "{idx_name}"')
+        conn.execute(BLOCK_OP_TABLE_SQL)
+        conn.execute(
+            "INSERT INTO block_op(id,batch_id,row_idx,col_idx,side,op,"
+            "temp_max,temp_min,cell_count) "
+            "SELECT id,batch_id,row_idx,col_idx,side,op,"
+            "temp_max,temp_min,cell_count FROM block_op_legacy ORDER BY id")
+        conn.execute("DROP TABLE block_op_legacy")
+        # 显式带 id 复制后同步自增序列：确保下一条 id 大于所有历史 id
+        seq_row = conn.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name='block_op'").fetchone()
+        max_id = conn.execute("SELECT MAX(id) FROM block_op").fetchone()[0]
+        if max_id is not None:
+            if seq_row is None:
+                conn.execute("INSERT INTO sqlite_sequence(name,seq) "
+                             "VALUES('block_op',?)", (max_id,))
+            elif seq_row[0] < max_id:
+                conn.execute(
+                    "UPDATE sqlite_sequence SET seq=? WHERE name='block_op'",
+                    (max_id,))
+    return True
+
+
+def _ensure_blocks_current(conn: sqlite3.Connection) -> bool:
+    """旧库可能缺物化表；返回是否需要按日志重放补齐。"""
+    if _table_sql(conn, "blocks_current") is not None:
+        return False
+    conn.executescript(BLOCKS_CURRENT_SQL)
+    return True
 
 
 @contextmanager
@@ -216,6 +297,65 @@ def current_block_count(conn: sqlite3.Connection) -> int:
     if current_batch_id(conn) is None:
         return 0
     return conn.execute("SELECT COUNT(*) FROM blocks_current").fetchone()[0]
+
+
+# ----------------------------- 重放 --------------------------------
+#
+# 从最近一次全量出块批次（reason=upload/tolerance）起，按 block_op.id
+# 顺序重放，混用旧库逐块 tombstone 与新 tombstone_range：
+#
+#   base / add        : 覆盖该坐标的现行块（同址后写覆盖先写）
+#   tombstone         : 精确作废该坐标（旧库格式，原样兼容）
+#   tombstone_range   : 作废严格位于该区域内部的现行块；区域原点上的块
+#                       （同批写出的大块）保留。每个合并区域只记一条。
+#
+# 结果应与 blocks_current 逐块相同，用于自检与旧库补建物化表。
+# 以批次 reason 而非 base 行锚定，全未测上传（零块、无 base 行）也能重放。
+
+_BASE_BATCH_SQL = """
+SELECT b.id FROM batch b
+WHERE b.grid_id=1 AND b.reason IN ('upload','tolerance')
+ORDER BY b.id DESC LIMIT 1
+"""
+
+
+def replay_current_blocks(conn: sqlite3.Connection) -> List[Block]:
+    """
+    从日志重放现行块（自最近一次 base 批次起）。不依赖 blocks_current，
+    供初始迁移、自检以及外部核对使用。
+    """
+    row = conn.execute(_BASE_BATCH_SQL).fetchone()
+    if row is None:
+        return []
+
+    live: Dict[Tuple[int, int, int], Block] = {}
+    for r, c, s, op, tmax, tmin, cnt in conn.execute(
+            "SELECT row_idx, col_idx, side, op, temp_max, temp_min, cell_count "
+            "FROM block_op WHERE batch_id>=? ORDER BY id", (row[0],)):
+        if op in ("base", "add"):
+            live[(r, c, s)] = Block(r, c, s, tmax, tmin, cnt)
+        elif op == "tombstone":
+            live.pop((r, c, s), None)
+        elif op == "tombstone_range":
+            # 区域坐标上的块是同批新写的大块，保留；只作废其内部旧块。
+            victims = [pos for pos in live
+                       if pos != (r, c, s)
+                       and pos[0] >= r and pos[1] >= c
+                       and pos[0] + pos[2] <= r + s and pos[1] + pos[2] <= c + s]
+            for pos in victims:
+                del live[pos]
+    return list(live.values())
+
+
+def replay_matches_materialized(conn: sqlite3.Connection) -> bool:
+    """自检：日志重放结果与物化现行块逐块相同。"""
+    if current_batch_id(conn) is None:
+        return not conn.execute("SELECT 1 FROM blocks_current LIMIT 1").fetchone()
+    materialized = {(b.row, b.col, b.size, b.tmax, b.tmin, b.count)
+                    for b in load_current_blocks(conn)}
+    replayed = {(b.row, b.col, b.size, b.tmax, b.tmin, b.count)
+                for b in replay_current_blocks(conn)}
+    return materialized == replayed
 
 
 # --------------------------- 内部工具 ------------------------------
@@ -373,12 +513,42 @@ def _rebuild_materialized(conn: sqlite3.Connection,
 
 
 def _apply_delta_materialized(conn: sqlite3.Connection,
-                              tombstones: List[Tuple[int, int, int]],
-                              adds: List[Block]) -> None:
-    """把局部块增量应用到物化表：同址 UPSERT，删除坐标先删后插。"""
-    conn.executemany(
-        "DELETE FROM blocks_current WHERE row_idx=? AND col_idx=? AND side=?",
-        tombstones)
+                              exact_tomb: List[Tuple[int, int, int]],
+                              range_tomb: List[Tuple[int, int, int]],
+                              adds: List[Block]) -> Dict[str, object]:
+    """
+    把局部块增量应用到物化表，只用物化表做局部核算，不回查历史日志。
+
+    范围作废先执行：只删除严格位于区域内部的行，区域原点上的块是同批
+    新写的大块，保留并由后续 UPSERT 更新。实际删到行的区域才留下一条
+    范围作废记录；精确坐标只在物化表中仍存在时才留下逐块记录。
+    这样记录数与真实删除量一致，合并成片小块时每个区域最多一条。
+
+    返回 {"removed": 实际删除块数, "ranges": 写出范围记录, "exacts": 写出逐块记录}。
+    """
+    removed = 0
+    used_ranges: List[Tuple[int, int, int]] = []
+    for r, c, s in range_tomb:
+        # 块都按四叉树对齐，不会与区域部分相交；用起点范围走主键索引，
+        # 再保留完整包含条件作兜底。区域原点上的同批大块由 side<s 排除。
+        cur = conn.execute(
+            "DELETE FROM blocks_current "
+            "WHERE row_idx>=? AND row_idx<? AND col_idx>=? AND col_idx<? "
+            "AND side<? "
+            "AND row_idx+side<=? AND col_idx+side<=?",
+            (r, r + s, c, c + s, s, r + s, c + s))
+        if cur.rowcount:
+            removed += cur.rowcount
+            used_ranges.append((r, c, s))
+
+    used_exacts = _live_positions(conn, exact_tomb)
+    if used_exacts:
+        conn.executemany(
+            "DELETE FROM blocks_current "
+            "WHERE row_idx=? AND col_idx=? AND side=?",
+            used_exacts)
+        removed += len(used_exacts)
+
     conn.executemany(
         "INSERT INTO blocks_current(row_idx,col_idx,side,temp_max,temp_min,cell_count) "
         "VALUES(?,?,?,?,?,?) "
@@ -387,6 +557,29 @@ def _apply_delta_materialized(conn: sqlite3.Connection,
         "cell_count=excluded.cell_count",
         [(b.row, b.col, b.size, b.tmax, b.tmin, b.count) for b in adds],
     )
+    return {"removed": removed, "ranges": used_ranges, "exacts": used_exacts}
+
+
+def _live_positions(conn: sqlite3.Connection,
+                    positions: List[Tuple[int, int, int]]
+                    ) -> List[Tuple[int, int, int]]:
+    """
+    从物化表里筛出仍然存在的坐标（局部核算，不查历史日志）。
+    用临时表按主键 JOIN，代价与待查坐标数成正比，与物化表总行数无关。
+    """
+    wanted = list(dict.fromkeys(positions))
+    if not wanted:
+        return []
+    conn.execute("CREATE TEMP TABLE t_want_block(r INT, c INT, s INT)")
+    try:
+        conn.executemany("INSERT INTO t_want_block VALUES(?,?,?)", wanted)
+        rows = conn.execute(
+            "SELECT b.row_idx, b.col_idx, b.side FROM blocks_current b "
+            "JOIN t_want_block w ON b.row_idx=w.r AND b.col_idx=w.c AND b.side=w.s"
+        ).fetchall()
+    finally:
+        conn.execute("DROP TABLE t_want_block")
+    return [(r[0], r[1], r[2]) for r in rows]
 
 
 # ----------------------------- 服务 --------------------------------
@@ -454,8 +647,8 @@ def update_tolerance(conn: sqlite3.Connection, tol: int) -> Dict[str, int]:
                      v["temp_min"], v["temp_max"])
                  for k, v in node_rows.items()}
         blocks = quadtree.collect_blocks(stats, cells, n, tol)
-        # 温差是全局变化，旧 delta 链不再有参考价值，整体以 base 重建
-        conn.execute("DELETE FROM block_op")
+        # 温差是全局变化：以整套 base 开新批次，重放从这批发车，
+        # 旧 delta 链不再参与；但历史记录原样保留，不做截断。
         bid = _new_batch(conn, "tolerance", tol, len(blocks))
         _write_base_blocks(conn, bid, blocks)
         _rebuild_materialized(conn, blocks)
@@ -504,7 +697,8 @@ def apply_edits(conn: sqlite3.Connection,
         if not real:
             _log(conn, "edit", "提交的改动与现值一致，未产生新批次")
             return {"nodes_recomputed": 0, "blocks_added": 0,
-                    "blocks_removed": 0, "changed_cells": 0}
+                    "blocks_removed": 0, "tombstone_records": 0,
+                    "tombstone_ranges": 0, "changed_cells": 0}
 
         # 1) 批量写格子
         conn.executemany(
@@ -522,26 +716,30 @@ def apply_edits(conn: sqlite3.Connection,
         if n == 1:
             v = cells.get((0, 0))
             bid = _new_batch(conn, "edit", tol, 1 if v is not None else 0)
-            conn.execute(
-                "INSERT INTO block_op(batch_id,row_idx,col_idx,side,op,"
-                "temp_max,temp_min,cell_count) "
-                "VALUES(?,0,0,1,'tombstone',NULL,NULL,NULL)", (bid,))
+            cur = conn.execute(
+                "DELETE FROM blocks_current WHERE row_idx=0 AND col_idx=0 AND side=1")
+            removed = cur.rowcount
+            # 仅有旧块被删时才写作废记录；首次补测不产生空作废
+            if removed:
+                conn.execute(
+                    "INSERT INTO block_op(batch_id,row_idx,col_idx,side,op,"
+                    "temp_max,temp_min,cell_count) "
+                    "VALUES(?,0,0,1,'tombstone',NULL,NULL,NULL)", (bid,))
             added = 0
             if v is not None:
                 conn.execute(
                     "INSERT INTO block_op(batch_id,row_idx,col_idx,side,op,"
                     "temp_max,temp_min,cell_count) "
                     "VALUES(?,0,0,1,'add',?,?,1)", (bid, v, v))
-                added = 1
-            conn.execute("DELETE FROM blocks_current WHERE row_idx=0 AND col_idx=0 AND side=1")
-            if v is not None:
                 conn.execute(
                     "INSERT INTO blocks_current(row_idx,col_idx,side,temp_max,temp_min,cell_count) "
                     "VALUES(0,0,1,?,?,1)", (v, v))
+                added = 1
             conn.execute("UPDATE grid SET updated_at=? WHERE id=1", (_now(),))
             _log(conn, "edit", f"n=1 单格改动，现行块数 {1 if v is not None else 0}")
             return {"nodes_recomputed": 0, "blocks_added": added,
-                    "blocks_removed": 1, "changed_cells": 1}
+                    "blocks_removed": removed, "tombstone_records": 1 if removed else 0,
+                    "tombstone_ranges": 0, "changed_cells": 1}
 
         ordered = sorted(affected, key=lambda x: x[2])
         # 重算节点还要读其孩子，加载集合 = 受影响节点 ∪ 其 size>=2 子节点
@@ -653,78 +851,52 @@ def apply_edits(conn: sqlite3.Connection,
                 adds.append(Block(pos[0], pos[1], 1, v, v, 1))
 
         exact_tomb = [t for t in tombstones if t[0] != "region"]
-        region_tomb = [t for t in tombstones if t[0] == "region"]
+        region_tomb = [(t[1], t[2], t[3]) for t in tombstones if t[0] == "region"]
 
         # 同批次同坐标既有精确墓碑又有 add 时，add 本身即覆盖旧状态，取消该墓碑
         add_positions = {(b.row, b.col, b.size) for b in adds}
-        exact_tomb = [t for t in exact_tomb if t not in add_positions]
+        exact_tomb = list(dict.fromkeys(
+            t for t in exact_tomb if t not in add_positions))
+        # 每个合并区域最多一条范围作废记录，按坐标去重
+        region_tomb = list(dict.fromkeys(region_tomb))
 
-        # 精确墓碑：只有 delta 链上该坐标最新操作仍是有效块时才写。
-        # 不能只查物化表：被更大祖先块覆盖的坐标没有物化行，
-        # 但 delta 里可能残留更早的 base/add，祖先拆分后必须显式作废。
-        if exact_tomb:
-            active_pos = set()
-            for i in range(0, len(exact_tomb), 300):
-                chunk = exact_tomb[i:i + 300]
-                t_where = " OR ".join(
-                    "(o.row_idx=? AND o.col_idx=? AND o.side=?)" for _ in chunk)
-                t_keys = [v for tup in chunk for v in tup]
-                for r in conn.execute(
-                        "WITH latest AS ("
-                        "SELECT o.row_idx, o.col_idx, o.side, MAX(o.id) AS mid "
-                        "FROM block_op o JOIN batch b ON b.id=o.batch_id "
-                        f"WHERE b.grid_id=1 AND ({t_where}) "
-                        "GROUP BY o.row_idx, o.col_idx, o.side) "
-                        "SELECT l.row_idx, l.col_idx, l.side FROM latest l "
-                        "JOIN block_op x ON x.id=l.mid WHERE x.op<>'tombstone'",
-                        t_keys):
-                    active_pos.add((r["row_idx"], r["col_idx"], r["side"]))
-            exact_tomb = [t for t in exact_tomb if t in active_pos]
-
-        # 区域墓碑：展开为该区域内 delta 链上仍有效的全部块坐标。
-        # 块合并时这些后代块都被新的大块吸收，必须逐条作废，
-        # 否则 delta 还原与物化表都会残留被吸收的旧块。
-        region_positions: List[Tuple[int, int, int]] = []
-        for (_, rr, cc, ss) in region_tomb:
-            rows = conn.execute(
-                "WITH latest AS ("
-                "SELECT o.row_idx, o.col_idx, o.side, MAX(o.id) AS mid "
-                "FROM block_op o JOIN batch b ON b.id=o.batch_id "
-                "WHERE b.grid_id=1 AND o.row_idx>=? AND o.col_idx>=? "
-                "AND o.row_idx+o.side<=? AND o.col_idx+o.side<=? "
-                "GROUP BY o.row_idx, o.col_idx, o.side) "
-                "SELECT l.row_idx, l.col_idx, l.side FROM latest l "
-                "JOIN block_op x ON x.id=l.mid WHERE x.op<>'tombstone'",
-                (rr, cc, rr + ss, cc + ss)).fetchall()
-            for row in rows:
-                pos = (row["row_idx"], row["col_idx"], row["side"])
-                if pos not in add_positions:
-                    region_positions.append(pos)
-        # 去重（多个区域/精确墓碑可能指向同一坐标）
-        all_tomb = list(dict.fromkeys(exact_tomb + region_positions))
-
-        # 4) 建新批次，只写局部增量，并同步物化现行块表
+        # 4) 建新批次，追加局部变更。物化表先做局部删除核算，再据实际
+        #    删除结果写记录：没删到块的作废意图不落日志，避免无意义记录。
         bid = _new_batch(conn, "edit", tol, 0)
+        applied = _apply_delta_materialized(conn, exact_tomb, region_tomb, adds)
+        used_ranges = applied["ranges"]
+        used_exacts = applied["exacts"]
+        # 先写作废记录、再写 add：重放按 id 顺序进行，
+        # 同批新写的大块因此不会被自己的范围记录带走。
+        conn.executemany(
+            "INSERT INTO block_op(batch_id,row_idx,col_idx,side,op,"
+            "temp_max,temp_min,cell_count) "
+            "VALUES(?,?,?,?,'tombstone_range',NULL,NULL,NULL)",
+            [(bid, r, c, s) for (r, c, s) in used_ranges])
         conn.executemany(
             "INSERT INTO block_op(batch_id,row_idx,col_idx,side,op,"
             "temp_max,temp_min,cell_count) "
             "VALUES(?,?,?,?,'tombstone',NULL,NULL,NULL)",
-            [(bid, r, c, s) for (r, c, s) in all_tomb])
+            [(bid, r, c, s) for (r, c, s) in used_exacts])
         conn.executemany(
             "INSERT INTO block_op(batch_id,row_idx,col_idx,side,op,"
             "temp_max,temp_min,cell_count) "
             "VALUES(?,?,?,?,'add',?,?,?)",
             [(bid, b.row, b.col, b.size, b.tmax, b.tmin, b.count)
              for b in adds])
-        _apply_delta_materialized(conn, all_tomb, adds)
 
         count = current_block_count(conn)
         conn.execute("UPDATE batch SET block_count=? WHERE id=?", (count, bid))
         conn.execute("UPDATE grid SET updated_at=? WHERE id=1", (_now(),))
+        record_count = len(used_ranges) + len(used_exacts)
         _log(conn, "edit",
              f"改动 {len(real)} 格，重算节点 {len(ordered)} 个，"
-             f"add {len(adds)} / tombstone {len(all_tomb)}，现行块数 {count}")
+             f"add {len(adds)} / 删除块 {applied['removed']} / "
+             f"作废记录 {record_count}（区域 {len(used_ranges)}），"
+             f"现行块数 {count}")
         return {"nodes_recomputed": len(ordered),
                 "blocks_added": len(adds),
-                "blocks_removed": len(all_tomb),
+                "blocks_removed": applied["removed"],
+                "tombstone_records": record_count,
+                "tombstone_ranges": len(used_ranges),
                 "changed_cells": len(real)}
